@@ -1,4 +1,6 @@
 #include <cstdio>
+#include <ctime>
+#include <string>
 #include <utility>
 
 #include "frameset_pool.hpp"
@@ -10,6 +12,25 @@ namespace {
 // two views is the floor for triangulation, so a set holding at least this
 // many is still worth handing out
 constexpr size_t MIN_USEFUL_FRAMES = 2;
+
+// picam stamps capture time in nanoseconds since the epoch, which says nothing
+// on a log line. Wall clock to the millisecond is what lines a drop up against
+// whatever else was happening at the time.
+std::string format_timestamp(uint64_t timestamp) {
+  const std::time_t seconds = static_cast<std::time_t>(timestamp / 1000000000ULL);
+  const unsigned milliseconds =
+    static_cast<unsigned>((timestamp % 1000000000ULL) / 1000000ULL);
+
+  std::tm local{};
+  if (!localtime_r(&seconds, &local))
+    return std::to_string(timestamp);
+
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d.%03u",
+                local.tm_hour, local.tm_min, local.tm_sec, milliseconds);
+
+  return buffer;
+}
 
 } // namespace
 
@@ -43,7 +64,8 @@ std::optional<uint32_t> FramesetPool::claim_slot() {
   // the consumer is behind. drop the oldest completed set rather than the
   // newest, so it resumes on current data instead of working through a backlog.
   if (std::optional<uint32_t> oldest = m_completed_sets.try_pop()) {
-    std::printf("[frameset] consumer behind, dropped set %lu\n", m_slots[*oldest].timestamp);
+    std::printf("[frameset] consumer behind, dropped set at %s\n",
+                format_timestamp(m_slots[*oldest].timestamp).c_str());
     clear_slot(*oldest);
     return oldest;
   }
@@ -57,12 +79,13 @@ void FramesetPool::emit_open_set() {
 
   if (set.surfaces.size() >= MIN_USEFUL_FRAMES) {
     if (set.surfaces.size() < m_camera_count)
-      std::printf("[frameset] partial set at %lu, %zu of %zu cameras\n",
-                  set.timestamp, set.surfaces.size(), m_camera_count);
+      std::printf("[frameset] partial set at %s, %zu of %zu cameras\n",
+                  format_timestamp(set.timestamp).c_str(),
+                  set.surfaces.size(), m_camera_count);
     m_completed_sets.push(*m_open_set);
   } else {
-    std::printf("[frameset] dropped set at %lu, only %zu camera(s) delivered\n",
-                set.timestamp, set.surfaces.size());
+    std::printf("[frameset] dropped set at %s, only %zu camera(s) delivered\n",
+                format_timestamp(set.timestamp).c_str(), set.surfaces.size());
     recycle_slot(*m_open_set);
   }
 
