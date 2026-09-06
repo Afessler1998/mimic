@@ -23,6 +23,13 @@ constexpr float SQUARE_SIZE = 25.0f;   // mm
 // calibrateCamera is expensive, so a camera that has enough frames is retried
 // only every few new ones rather than after each
 constexpr int RECALIBRATE_EVERY = 5;
+
+// The loop runs faster than anyone can move a board, so without this it banks
+// ten copies of one pose in under a second. Ten views of the same pose leave
+// focal length and board distance trading off against each other freely, which
+// solves to a low reprojection error and physically wrong intrinsics. Only
+// tilting the board between views breaks that tie.
+constexpr std::chrono::milliseconds ACCEPT_COOLDOWN{1500};
 constexpr std::chrono::microseconds POLL_INTERVAL{500};
 constexpr int ESC_KEY = 27;
 
@@ -31,6 +38,9 @@ struct CameraProgress {
   int last_attempt = 0;
   bool calibrated = false;
   double error = 0.0;
+
+  // default constructs to the epoch, so the first view is never held back
+  std::chrono::steady_clock::time_point last_accepted{};
 };
 
 bool all_calibrated(const std::vector<CameraProgress>& progress) {
@@ -55,15 +65,28 @@ void attempt_calibration(mocap::LensCalibration& calibrator,
   camera.last_attempt = camera.accepted;
   camera.error = calibrator.calibrate();
 
-  if (!calibrator.check_status()) {
-    std::println("[{}] {} frames, reprojection error {:.4f} px, still above {:.1f}",
-                 name, camera.accepted, camera.error, mocap::MIN_ERR);
+  const mocap::CalibrationStatus status = calibrator.status();
+  if (status != mocap::CalibrationStatus::Ok) {
+    std::println("[{}] {} frames, reprojection error {:.4f} px, rejected: {}",
+                 name, camera.accepted, camera.error, mocap::describe(status));
     return;
   }
 
   camera.calibrated = true;
   std::println("[{}] calibrated: {} frames, reprojection error {:.4f} px",
                name, camera.accepted, camera.error);
+}
+
+// how many views each camera has banked, so the operator can tell a camera
+// that is not seeing the board from a tool that is not running
+void print_progress(const std::vector<CameraProgress>& progress,
+                    const std::vector<mocap::Camera>& cameras) {
+  for (size_t i = 0; i < cameras.size(); i += 1)
+    std::print("{} {}/{}{}   ", cameras[i].name, progress[i].accepted,
+               mocap::MIN_FRAMES, progress[i].calibrated ? " done" : "");
+
+  std::print("\r");
+  std::fflush(stdout);
 }
 
 // runs until every camera meets MIN_ERR, or the operator presses escape
@@ -81,6 +104,7 @@ void collect_until_calibrated(mocap::Session& session,
   cv::Mat gray;
   cv::Mat preview;
   bool running = true;
+  bool pending_solve = false;
 
   while (running && !all_calibrated(progress)) {
     std::optional<mocap::Frameset> set = session.try_acquire_frameset();
@@ -91,13 +115,20 @@ void collect_until_calibrated(mocap::Session& session,
 
     for (const mocap::FrameView& view : set->frames) {
       CameraProgress& camera = progress[view.camera_id];
-      if (camera.calibrated)
-        continue;
 
       if (!mocap::copy_gray_to_host(view, gray))
         continue;
 
-      const bool found = calibrators[view.camera_id].try_frame(gray);
+      // A camera that is done, or waiting out its cooldown, still gets drawn.
+      // Its window is the only way to see where the board is while walking it
+      // around, and a window that stops updating reads as the tool having hung.
+      // Skipping the search is also what keeps the preview responsive, since
+      // findChessboardCorners is the expensive part of this loop.
+      const std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+      const bool searching = !camera.calibrated
+                          && now - camera.last_accepted >= ACCEPT_COOLDOWN;
+      const bool found = searching && calibrators[view.camera_id].try_frame(gray);
 
       cv::cvtColor(gray, preview, cv::COLOR_GRAY2BGR);
       if (found)
@@ -110,12 +141,30 @@ void collect_until_calibrated(mocap::Session& session,
         continue;
 
       camera.accepted += 1;
-
-      if (due_for_calibration(camera))
-        attempt_calibration(calibrators[view.camera_id], camera, cameras[view.camera_id].name);
+      camera.last_accepted = now;
+      pending_solve = pending_solve || due_for_calibration(camera);
     }
 
+    // The frameset is handed back before solving, because calibrateCamera
+    // takes seconds and holding a decoder surface across it back pressures
+    // into the cameras for no reason.
     session.release_frameset(*set);
+
+    print_progress(progress, cameras);
+
+    if (!pending_solve)
+      continue;
+
+    pending_solve = false;
+    for (size_t i = 0; i < cameras.size(); i += 1) {
+      if (!due_for_calibration(progress[i]))
+        continue;
+
+      // the solve blocks this thread, so the windows stop repainting for its
+      // duration. saying so beats looking hung.
+      std::println("\n[{}] solving on {} views", cameras[i].name, progress[i].accepted);
+      attempt_calibration(calibrators[i], progress[i], cameras[i].name);
+    }
   }
 }
 
@@ -168,10 +217,14 @@ int main() {
                BOARD_WIDTH, BOARD_HEIGHT);
   std::println("each needs at least {} views and under {:.1f} px error",
                mocap::MIN_FRAMES, mocap::MIN_ERR);
+  std::println("move the board between views: tilt it, and cover the corners of");
+  std::println("the frame, not just the middle");
   std::println("escape to stop early\n");
 
   collect_until_calibrated(*session, calibrators, progress, conf.cameras);
 
+  // the windows go away here, so say why before they do
+  std::println("\ndone collecting, closing previews");
   cv::destroyAllWindows();
 
   std::println("");

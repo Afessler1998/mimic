@@ -2,6 +2,9 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
 
+#include <algorithm>
+#include <cmath>
+
 #include "lens_calibration.hpp"
 
 namespace mocap {
@@ -99,9 +102,47 @@ double LensCalibration::calibrate() {
   return reprojection_err;
 }
 
+const char* describe(CalibrationStatus status) {
+  switch (status) {
+    case CalibrationStatus::Ok:                      return "ok";
+    case CalibrationStatus::TooFewFrames:            return "too few views";
+    case CalibrationStatus::HighError:               return "reprojection error too high";
+    case CalibrationStatus::PrincipalPointOffCenter: return "principal point off the sensor center";
+    case CalibrationStatus::FocalLengthsDisagree:    return "fx and fy disagree";
+  }
+
+  return "unknown";
+}
+
+// Reprojection error only says the solution fits the views it was fit to. Views
+// that all share a pose let focal length and board distance trade off against
+// each other, so a whole family of solutions fits them equally well and the
+// optimizer returns whichever one it wandered into. These two checks ask the
+// separate question of whether the answer describes a camera that could exist.
+CalibrationStatus LensCalibration::status() const {
+  if (frame_count < MIN_FRAMES)
+    return CalibrationStatus::TooFewFrames;
+
+  if (reprojection_err >= MIN_ERR)
+    return CalibrationStatus::HighError;
+
+  const double fx = cam_matrix.at<double>(0, 0);
+  const double fy = cam_matrix.at<double>(1, 1);
+  const double cx = cam_matrix.at<double>(0, 2);
+  const double cy = cam_matrix.at<double>(1, 2);
+
+  if (std::abs(cx - frame_width / 2.0) > MAX_CENTER_OFFSET * frame_width ||
+      std::abs(cy - frame_height / 2.0) > MAX_CENTER_OFFSET * frame_height)
+    return CalibrationStatus::PrincipalPointOffCenter;
+
+  if (std::abs(fx - fy) > MAX_FOCAL_SKEW * std::max(fx, fy))
+    return CalibrationStatus::FocalLengthsDisagree;
+
+  return CalibrationStatus::Ok;
+}
+
 bool LensCalibration::check_status() {
-  if (frame_count < MIN_FRAMES) return false;
-  return reprojection_err < 1.0;
+  return status() == CalibrationStatus::Ok;
 }
 
 // image size, reproj_err and images_used are provenance: they record what this
