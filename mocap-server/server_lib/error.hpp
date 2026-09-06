@@ -5,6 +5,8 @@
 #include <string>
 #include <system_error>
 
+#include "visibility.hpp"
+
 namespace mocap {
 
 struct Error {
@@ -17,7 +19,9 @@ struct Error {
 template <typename T>
 using Result = std::expected<T, Error>;
 
-Error errno_error(std::string detail);
+// exported: Error is part of the API, so callers producing their own errors
+// should not have to hand roll the error_code
+MOCAP_API Error errno_error(std::string detail);
 
 // not a failure: the operation made no progress and should be retried when
 // its fd next wakes up. short circuits an and_then chain without ending it.
@@ -28,7 +32,7 @@ bool is_retry(const Error& err);
 // the listener stays registered, so the camera is re-accepted when it retries.
 Error closed();
 bool is_closed(const Error& err);
-Error invalid(std::string detail);
+MOCAP_API Error invalid(std::string detail);
 
 } // namespace mocap
 
